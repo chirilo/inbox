@@ -5,19 +5,11 @@ from inbox.log import get_logger
 logger = get_logger()
 
 from inbox.sync.base_sync import BaseSyncMonitor
-from inbox.models import Event, Account
+from inbox.models import Event, Account, Calendar
 from inbox.util.debug import bind_context
 from inbox.models.session import session_scope
-from inbox.basicauth import ValidationError
-from inbox.util.misc import MergeError
 
 from inbox.events.google import GoogleEventsProvider
-from inbox.events.outlook import OutlookEventsProvider
-from inbox.events.icloud import ICloudEventsProvider
-
-EVENT_SYNC_PROVIDER_MAP = {'gmail': GoogleEventsProvider,
-                           'outlook': OutlookEventsProvider,
-                           'icloud': ICloudEventsProvider}
 
 
 EVENT_SYNC_FOLDER_ID = -2
@@ -40,112 +32,139 @@ class EventSync(BaseSyncMonitor):
     ---------
     log: logging.Logger
         Logging handler.
+
     """
     def __init__(self, email_address, provider_name, account_id, namespace_id,
                  poll_frequency=300):
         bind_context(self, 'eventsync', account_id)
         self.log = logger.new(account_id=account_id, component='event sync')
         self.log.info('Begin syncing Events...')
-
-        self.provider_name = provider_name
-
-        self.folder_id = EVENT_SYNC_FOLDER_ID
-        self.folder_name = EVENT_SYNC_FOLDER_NAME
-        self.email_address = email_address
-
-        provider_cls = EVENT_SYNC_PROVIDER_MAP[self.provider_name]
-        self.provider = provider_cls(account_id, namespace_id)
+        # Only Google for now, can easily parametrize by provider later.
+        self.provider = GoogleEventsProvider(account_id, namespace_id)
 
         BaseSyncMonitor.__init__(self,
                                  account_id,
                                  namespace_id,
+                                 email_address,
                                  EVENT_SYNC_FOLDER_ID,
-                                 poll_frequency=poll_frequency,
-                                 retry_fail_classes=[ValidationError])
+                                 EVENT_SYNC_FOLDER_NAME,
+                                 provider_name,
+                                 poll_frequency=poll_frequency)
 
     def sync(self):
         """Query a remote provider for updates and persist them to the
         database. This function runs every `self.poll_frequency`.
-
         """
-        # Grab timestamp so next sync gets deltas from now
+        # Get a timestamp before polling, so that we don't subsequently miss
+        # remote updates that happen while the poll loop is executing.
         sync_timestamp = datetime.utcnow()
 
         with session_scope() as db_session:
             account = db_session.query(Account).get(self.account_id)
-            last_sync_dt = account.last_synced_contacts
+            last_sync = account.last_synced_events
 
-            all_events = self.provider.get_items(sync_from_dt=last_sync_dt)
+        deleted_uids, calendar_changes = self.provider.get_calendars()
+        with session_scope() as db_session:
+            handle_calendar_deletes(self.namespace_id, deleted_uids,
+                                    db_session)
+            calendar_uids_and_ids = handle_calendar_updates(self.namespace_id,
+                                                            calendar_changes,
+                                                            self.log,
+                                                            db_session)
+            db_session.commit()
 
-            change_counter = Counter()
-            for new_event in all_events:
+        for (uid, id_) in calendar_uids_and_ids:
+            deleted_uids, event_changes = self.provider.get_events(
+                uid, sync_from_time=last_sync)
+            with session_scope() as db_session:
+                handle_event_deletes(self.namespace_id, id_, deleted_uids,
+                                     db_session)
+                handle_event_updates(self.namespace_id, id_, event_changes,
+                                     self.log, db_session)
+                db_session.commit()
 
-                new_event.namespace = account.namespace
-                # TODO remove these checks
-                assert new_event.uid is not None, \
-                    'Got remote item with null uid'
-                assert isinstance(new_event.uid, basestring)
-
-                events_query = db_session.query(Event).filter(
-                    Event.namespace_id == self.namespace_id,
-                    Event.provider_name == self.provider.PROVIDER_NAME,
-                    Event.uid == new_event.uid)
-
-                # Snapshot of item data from immediately after last sync:
-                cached_item = events_query. \
-                    filter(Event.source == 'remote').first()
-
-                # Item data reflecting any local modifications since the last
-                # sync with the remote provider:
-                local_item = events_query. \
-                    filter(Event.source == 'local').first()
-
-                if new_event.deleted:
-                    if cached_item is not None:
-                        db_session.delete(cached_item)
-                        change_counter['deleted'] += 1
-                    if local_item is not None:
-                        db_session.delete(local_item)
-                    continue
-                # Otherwise, update the database.
-                if cached_item is not None:
-                    # The provider gave an update to a item we already have.
-                    if local_item is not None:
-                        try:
-                            # Attempt to merge remote updates into local_item
-                            local_item.merge_from(cached_item, new_event)
-                            # And update cached_item to reflect both local and
-                            # remote updates
-                            cached_item.copy_from(local_item)
-
-                        except MergeError:
-                            self.log.error(
-                                'Conflicting local and remote updates to '
-                                'item.', local=local_item, cached=cached_item,
-                                remote=new_event)
-                            # For now, just don't update if conflicting
-                            continue
-                    else:
-                        self.log.warning(
-                            'event is already present as remote but not local '
-                            'item', cached_item=cached_item)
-                        cached_item.copy_from(new_event)
-                    change_counter['updated'] += 1
-                else:
-                    # This is a new item, create both local and remote DB
-                    # entries.
-                    local_item = Event()
-                    local_item.copy_from(new_event)
-                    local_item.source = 'local'
-                    db_session.add_all([new_event, local_item])
-                    db_session.flush()
-                    change_counter['added'] += 1
-
-        # Set last full sync date upon completion
         with session_scope() as db_session:
             account = db_session.query(Account).get(self.account_id)
             account.last_synced_events = sync_timestamp
+            db_session.commit()
 
-        self.log.info('sync', added=change_counter['added'],
-                      updated=change_counter['updated'],
-                      deleted=change_counter['deleted'])
+
+def handle_calendar_deletes(namespace_id, deleted_calendar_uids, db_session):
+    for uid in deleted_calendar_uids:
+        local_calendar = db_session.query(Calendar).filter(
+            Calendar.namespace_id == namespace_id,
+            Calendar.uid == uid).first()
+        if local_calendar is not None:
+            # STOPSHIP(emfree): cascade to events on calendar, ensuring that we
+            # create delete revisions.
+            db_session.delete(local_calendar)
+
+
+def handle_calendar_updates(namespace_id, calendars, log, db_session):
+    """Persists new or updated Calendar objects to the database."""
+    ids_ = []
+    change_counter = Counter()
+    for calendar in calendars:
+        assert calendar.uid is not None, 'Got remote item with null uid'
+
+        local_calendar = db_session.query(Calendar).filter(
+            Calendar.namespace_id == namespace_id,
+            Calendar.uid == calendar.uid).first()
+
+        if local_calendar is not None:
+            local_calendar.update(calendar)
+            change_counter['updated'] += 1
+        else:
+            local_calendar = Calendar(namespace_id=namespace_id)
+            local_calendar.update(calendar)
+            db_session.add(local_calendar)
+            db_session.flush()
+            change_counter['added'] += 1
+
+        ids_.append((local_calendar.uid, local_calendar.id))
+
+    log.info('calendar sync',
+             added=change_counter['added'],
+             updated=change_counter['updated'])
+    return ids_
+
+
+def handle_event_deletes(namespace_id, calendar_id, deleted_event_uids,
+                         db_session):
+    for uid in deleted_event_uids:
+        local_event = db_session.query(Event).filter(
+            Event.namespace_id == namespace_id,
+            Event.uid == uid,
+            Event.calendar_id == calendar_id).first()
+        if local_event is not None:
+            db_session.delete(local_event)
+
+
+def handle_event_updates(namespace_id, calendar_id, events, log, db_session):
+    """Persists new or updated Event objects to the database."""
+    change_counter = Counter()
+    for event in events:
+        assert event.uid is not None, 'Got remote item with null uid'
+
+        # Note: we could bulk-load previously existing events instead of
+        # loading them one-by-one. This would make the first sync faster, and
+        # probably not really affect anything else.
+        local_event = db_session.query(Event).filter(
+            Event.namespace_id == namespace_id,
+            Event.calendar_id == calendar_id,
+            Event.uid == event.uid).first()
+
+        if local_event is not None:
+            local_event.update(event)
+            change_counter['updated'] += 1
+        else:
+            local_event = Event(namespace_id=namespace_id,
+                                calendar_id=calendar_id)
+            local_event.update(event)
+            db_session.add(local_event)
+            change_counter['added'] += 1
+
+    log.info('event sync',
+             calendar_id=calendar_id,
+             added=change_counter['added'],
+             updated=change_counter['updated'])
